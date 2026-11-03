@@ -60,7 +60,7 @@ def pushplus_bot(title, content):
         return
     
     print("PushPlus服务启动")
-    url = 'http://www.pushplus.plus/send'
+    url = 'https://www.pushplus.plus/send'
     data = {
         "token": PUSH_PLUS_TOKEN,
         "title": title,
@@ -68,7 +68,7 @@ def pushplus_bot(title, content):
     }
     headers = {'Content-Type': 'application/json'}
     try:
-        response = requests.post(url, json=data, headers=headers)
+        response = requests.post(url, json=data, headers=headers, timeout=30)
         result = response.json()
         if result.get('code') == 200:
             print('PushPlus推送成功！')

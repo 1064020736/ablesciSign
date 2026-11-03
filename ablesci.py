@@ -9,10 +9,13 @@ AbleSci自动签到脚本
 更新日期：2025年9月2日 >> 修复日志输出时间为北京时间 ; 修复签到前后用户信息显示 ; 优化登录失败处理 ; 优化签到已签到处理
 更新日期：2025年9月3日 >> 保护隐私，不在日志中显示完整邮箱和用户名
 更新日期：2026年3月22日 >> 支持本地.env文件; 使用zoneinfo/pytz处理时区; 统一通知器; 修复zoneinfo时区查找失败问题,增加回退机制; 修复已签到处理逻辑; 
+更新日期：2026年10月4日 >> 使用邮箱正则作为锚点解析账号，保留逗号/分号分隔多账号的旧格式，
+                        同时避免密码中的逗号/分号被误拆；移除所有可能泄露明文密码的日志打印
 作者：daitcl
 """
 
 import os
+import re
 import sys
 import time
 import requests
@@ -31,6 +34,10 @@ except ImportError:
 
 # 环境变量名常量
 ENV_ACCOUNTS = "ABLESCI_ACCOUNTS"
+
+# 邮箱匹配正则（用于识别账号锚点，避免按逗号/分号拆分时误伤密码）
+EMAIL_RE = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+
 
 def load_env_file():
     """
@@ -80,7 +87,22 @@ def load_env_file():
     elif account_lines:
         print(f"警告：存在无键账号行，但 {ENV_ACCOUNTS} 已通过系统或标准键值对设置，忽略无键行")
 
+    if ENV_ACCOUNTS in os.environ:
+        val = os.environ[ENV_ACCOUNTS]
+        # 隐私保护：只保留邮箱前缀，密码一律隐去
+        safe_lines = []
+        for line in val.splitlines():
+            if ":" in line:
+                local = line.split(":", 1)[0].strip()
+                safe_lines.append((local[:2] + "***") if local else "***")
+            else:
+                safe_lines.append("***")
+        safe = " / ".join(safe_lines)
+        print(f"当前 {ENV_ACCOUNTS} 内容预览: {safe}（共 {len(safe_lines)} 个账号，密码已隐藏）")
+
+
 load_env_file()
+
 
 def get_beijing_time():
     """
@@ -101,6 +123,7 @@ def get_beijing_time():
 
     return datetime.datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
 
+
 def protect_privacy(text):
     """保护隐私信息，隐藏部分邮箱和用户名"""
     if not text:
@@ -120,6 +143,7 @@ def protect_privacy(text):
         return text[:2] + "***"
     else:
         return "***"
+
 
 class Notifier:
     def __init__(self, title="科研通签到"):
@@ -179,6 +203,7 @@ class Notifier:
         """获取日志内容"""
         return "\n".join(self.log_content)
 
+
 class AbleSciAuto:
     def __init__(self, email, password, notifier=None):
         self.session = requests.Session()
@@ -204,22 +229,30 @@ class AbleSciAuto:
         self.notifier.log(message, level)
         
     def get_csrf_token(self):
-        """获取CSRF令牌，优先兼容新版 meta 标签。"""
+        """获取CSRF令牌
+
+        2026-09-15 站点前端改版：登录页不再输出 <input name="_csrf">，
+        令牌改为 <meta name="csrf-token" content="...">（同名 input 由 JS 在提交前填充，
+        静态抓取拿不到），同时新增 iframe 图形验证码（仅风控命中时触发）与
+        /site/confirm-login 二次确认（实测签到不需要走这一步）。
+        保留 input[_csrf] 作为回退，防止站点再改回去。
+        """
         login_url = "https://www.ablesci.com/site/login"
         try:
             response = self.session.get(login_url, headers=self.headers, timeout=30)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
-
-                csrf_meta = soup.select_one('meta[name="csrf-token"]')
-                if csrf_meta:
-                    csrf_token = csrf_meta.get('content', '')
-                    if csrf_token:
-                        return csrf_token
-
-                csrf_input = soup.select_one('input[name="_csrf"]')
-                if csrf_input:
-                    return csrf_input.get('value', '')
+                token = ''
+                meta = soup.find('meta', {'name': 'csrf-token'})
+                if meta and meta.get('content'):
+                    token = meta.get('content', '').strip()
+                if not token:
+                    csrf_input = soup.find('input', {'name': '_csrf'})
+                    if csrf_input:
+                        token = csrf_input.get('value', '')
+                if token:
+                    return token
+                self.log("CSRF令牌元素未找到（meta[csrf-token] 与 input[_csrf] 均缺失，页面结构可能再次变更）", "error")
             else:
                 self.log(f"获取CSRF令牌失败，状态码: {response.status_code}", "error")
         except Exception as e:
@@ -265,6 +298,7 @@ class AbleSciAuto:
                         self.log(f"登录成功: {result.get('msg')}", "success")
                         return True
                     else:
+                        # 隐私保护：服务端返回的 msg 一般不含密码，但如果将来出现异常内容，这里也不会打出密码
                         self.log(f"登录失败: {result.get('msg')}", "error")
                 except json.JSONDecodeError:
                     if "退出" in response.text:
@@ -275,6 +309,7 @@ class AbleSciAuto:
             else:
                 self.log(f"登录请求失败，状态码: {response.status_code}", "error")
         except Exception as e:
+            # 注意：requests 抛出的异常不包含 POST body，因此不会泄露密码
             self.log(f"登录过程中出错: {str(e)}", "error")
         return False
 
@@ -394,49 +429,65 @@ class AbleSciAuto:
         self.display_summary(is_before_sign=False)
         return True
 
+
 def get_accounts():
-    """从环境变量获取所有账号，不在日志中输出凭据。"""
+    """从环境变量获取所有账号
+
+    支持旧格式：
+    - 换行分隔多个账号
+    - 同一行用逗号或分号分隔多个账号
+    - 单个账号使用 邮箱:密码 或 邮箱|密码
+
+    解析时以“邮箱”为锚点，避免密码中的逗号/分号被误拆。
+    """
     accounts_env = os.getenv(ENV_ACCOUNTS)
     if not accounts_env:
         return []
 
-    accounts = []
-    # 支持换行符、分号、逗号分隔
-    for line in accounts_env.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if ";" in line:
-            accounts.extend(line.split(";"))
-        elif "," in line:
-            accounts.extend(line.split(","))
-        else:
-            accounts.append(line)
-
     valid_accounts = []
-    for index, account in enumerate(accounts, 1):
-        account = account.strip()
-        if not account:
-            continue
-        # 支持邮箱和密码用冒号、分号或竖线分隔
-        if ":" in account:
-            email, password = account.split(":", 1)
-        elif ";" in account:
-            email, password = account.split(";", 1)
-        elif "|" in account:
-            email, password = account.split("|", 1)
-        else:
-            print(f"警告：跳过格式错误的第 {index} 个账号项")
+
+    for line_no, raw_line in enumerate(accounts_env.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
             continue
 
-        email = email.strip()
-        password = password.strip()
-        if email and password:
-            valid_accounts.append((email, password))
-        else:
-            print(f"警告：第 {index} 个账号的邮箱或密码为空")
+        matches = [
+            m for m in EMAIL_RE.finditer(line)
+            if (m.start() == 0 or line[:m.start()].rstrip().endswith((',', ';')))
+            and line[m.end():].lstrip().startswith((':', '|'))
+        ]
+        if not matches:
+            # 隐私保护：不打印任何原始内容
+            print(f"警告：第 {line_no} 行未找到邮箱格式账号（内容已隐藏）")
+            continue
+
+        for i, m in enumerate(matches):
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+
+            segment = line[start:end].rstrip()
+
+            # 若后面还有下一个邮箱，说明末尾的 , 或 ; 是账号分隔符，去掉一个
+            if i + 1 < len(matches) and segment.endswith((',', ';')):
+                segment = segment[:-1].rstrip()
+
+            email = m.group(0)
+            rest = segment[len(email):].lstrip()
+
+            if rest.startswith(':') or rest.startswith('|'):
+                password = rest[1:].strip()
+            else:
+                # 隐私保护：不打印任何原始内容
+                print(f"警告：第 {line_no} 行账号格式错误（内容已隐藏）")
+                continue
+
+            if password:
+                valid_accounts.append((email, password))
+            else:
+                print(f"警告：第 {line_no} 行密码为空（内容已隐藏）")
 
     return valid_accounts
+
 
 def main():
     """主函数，处理多账号签到，统一通知器。"""
@@ -470,9 +521,6 @@ def main():
 
     if global_notifier.notify_enabled:
         global_notifier.send_notification()
-
-    if os.getenv("GITHUB_ACTIONS") == "true":
-        print(f"::set-output name=log_content::{global_notifier.get_content()}")
 
     return 0 if all_successful else 1
 
